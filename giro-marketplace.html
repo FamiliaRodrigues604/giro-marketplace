@@ -166,24 +166,81 @@
 (function(){
   "use strict";
 
-  /* ---------- storage ---------- */
-  const storage = (window.storage) ? window.storage : (function(){
-    const mem={};
-    return {
-      get:async(k)=> (k in mem)?{key:k,value:mem[k],shared:false}:null,
-      set:async(k,v)=>{mem[k]=v;return{key:k,value:v,shared:false};},
-      delete:async(k)=>{delete mem[k];return{key:k,deleted:true};},
-      list:async()=>({keys:Object.keys(mem)})
-    };
-  })();
+  /* ---------- storage (Supabase — persiste em qualquer navegador / GitHub Pages) ---------- */
+  const SUPABASE_URL = 'https://ctkfbghpsafmyinvwbzv.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_guqTcabXyGBiKLeGlyk5og_ns2P-4OQ';
+  const SB_HEADERS = { apikey: SUPABASE_KEY, Authorization: 'Bearer '+SUPABASE_KEY };
+
+  /* trava de segurança: se a leitura inicial falhar (rede/servidor fora),
+     bloqueamos gravações para o app NÃO sobrescrever dados bons com estado vazio. */
+  let STORAGE_OK = true;
+  let storageWarned = false;
+
+  const storage = {
+    async get(key){
+      try{
+        const res = await fetch(SUPABASE_URL+'/rest/v1/app_storage?key=eq.'+encodeURIComponent(key)+'&select=value', { headers: SB_HEADERS });
+        if(!res.ok){ STORAGE_OK = false; return null; }
+        const rows = await res.json();
+        if(!rows.length) return null;
+        return { key, value: rows[0].value, shared:false };
+      }catch(e){ STORAGE_OK = false; console.error('storage.get falhou', e); return null; }
+    },
+    async set(key, value){
+      try{
+        const res = await fetch(SUPABASE_URL+'/rest/v1/app_storage', {
+          method:'POST',
+          headers: Object.assign({}, SB_HEADERS, {'Content-Type':'application/json','Prefer':'resolution=merge-duplicates'}),
+          body: JSON.stringify({ key, value, updated_at: new Date().toISOString() })
+        });
+        if(!res.ok) throw new Error('HTTP '+res.status);
+        return { key, value, shared:false };
+      }catch(e){ console.error('storage.set falhou', e); return null; }
+    },
+    async delete(key){
+      try{
+        await fetch(SUPABASE_URL+'/rest/v1/app_storage?key=eq.'+encodeURIComponent(key), { method:'DELETE', headers: SB_HEADERS });
+        return { key, deleted:true };
+      }catch(e){ console.error('storage.delete falhou', e); return null; }
+    },
+    async list(prefix){
+      try{
+        let url = SUPABASE_URL+'/rest/v1/app_storage?select=key';
+        if(prefix) url += '&key=like.'+encodeURIComponent(prefix)+'*';
+        const res = await fetch(url, { headers: SB_HEADERS });
+        const rows = await res.json();
+        return { keys: rows.map(r=>r.key) };
+      }catch(e){ console.error('storage.list falhou', e); return { keys: [] }; }
+    }
+  };
+
+  /* namespace próprio — a tabela app_storage é compartilhada com o Finanças do Casal.
+     Prefixo evita qualquer colisão futura de chaves genéricas como 'config'. */
+  const NS = 'giro:';
+
   async function load(key, fb){
-    try{ const r=await storage.get(key,true); return (r&&r.value!=null)?JSON.parse(r.value):fb; }
-    catch(e){ return fb; }
+    try{
+      let r = await storage.get(NS+key);
+      if(!r || r.value==null){ r = await storage.get(key); } // legado sem prefixo
+      return (r && r.value!=null) ? JSON.parse(r.value) : fb;
+    }catch(e){ return fb; }
   }
+
+  function storageWarn(){
+    if(storageWarned) return;
+    storageWarned = true;
+    const bar = document.createElement('div');
+    bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#b3261e;color:#fff;'+
+      'font:600 13px/1.4 system-ui,sans-serif;padding:10px 14px;text-align:center';
+    bar.textContent = '⚠️ Sem conexão com o banco de dados. As alterações NÃO estão sendo salvas. Recarregue a página antes de continuar.';
+    document.body.appendChild(bar);
+  }
+
   async function save(key, data, attempt){
+    if(!STORAGE_OK){ storageWarn(); return; }
     attempt = attempt||0;
     try{
-      const r = await storage.set(key, JSON.stringify(data), true);
+      const r = await storage.set(NS+key, JSON.stringify(data));
       if(!r) throw new Error('resposta vazia do storage');
     }catch(e){
       if(attempt < 2){
@@ -191,6 +248,7 @@
         return save(key, data, attempt+1);
       }
       console.error('save '+key+' falhou após 3 tentativas', e);
+      storageWarn();
     }
   }
 
@@ -298,8 +356,10 @@
             <div class="sub">Controle de compra, reforma e revenda por item</div>
           </div>
         </div>
-        <div style="display:flex;gap:8px;align-items:center">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
           <button class="chip" id="cfgBtn">⚙ Configurações</button>
+          <button class="chip" id="bkpBtn">⬇ Backup</button>
+          <button class="chip" id="rstBtn">⬆ Restaurar</button>
         </div>
       </header>
 
@@ -320,6 +380,8 @@
 
     document.querySelectorAll('#tabs button').forEach(b=>{ b.onclick=()=>switchTab(b.dataset.tab,b); });
     document.getElementById('cfgBtn').onclick = editConfig;
+    document.getElementById('bkpBtn').onclick = exportBackup;
+    document.getElementById('rstBtn').onclick = importBackup;
     renderAll();
   }
 
@@ -345,6 +407,57 @@
     State.config.margemB = parseFloat(mb)||30;
     save('config', State.config);
     renderAll();
+  }
+
+  /* ---------- backup ---------- */
+  function exportBackup(){
+    const payload = {
+      app: 'giro-marketplace',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      items: State.items,
+      config: State.config,
+      refItems: State.refItems
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'giro-backup-' + todayISO() + '.json';
+    document.body.appendChild(a); a.click();
+    setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  }
+
+  function importBackup(){
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = 'application/json,.json';
+    inp.onchange = () => {
+      const file = inp.files && inp.files[0];
+      if(!file) return;
+      const rd = new FileReader();
+      rd.onload = () => {
+        let data;
+        try{ data = JSON.parse(rd.result); }
+        catch(e){ alert('Arquivo inválido: não é um JSON legível.'); return; }
+        if(!data || data.app !== 'giro-marketplace' || !Array.isArray(data.items)){
+          alert('Este arquivo não é um backup do Giro & Margem.'); return;
+        }
+        const msg = 'Restaurar backup de ' + (data.exportedAt||'').slice(0,10) + '?\n\n' +
+                    'Itens no backup: ' + data.items.length + '\n' +
+                    'Itens atuais: ' + State.items.length + '\n\n' +
+                    'ISTO SUBSTITUI TODOS OS DADOS ATUAIS.';
+        if(!confirm(msg)) return;
+        State.items = data.items;
+        if(data.config) State.config = Object.assign({}, State.config, data.config);
+        if(Array.isArray(data.refItems)) State.refItems = data.refItems;
+        save('items', State.items);
+        save('config', State.config);
+        save('refItems', State.refItems);
+        renderAll();
+        alert('Backup restaurado: ' + State.items.length + ' itens.');
+      };
+      rd.readAsText(file);
+    };
+    inp.click();
   }
 
   function renderAll(){ renderDash(); renderItens(); renderAnalise(); renderRef(); }
@@ -772,6 +885,7 @@
       State.refItems = CATALOGO_SUGERIDO.map(c=>({id:uid(), name:c.name, cat:c.cat, precoPago:0}));
     }
     shell();
+    if(!STORAGE_OK) storageWarn();
   })();
 })();
 </script>
